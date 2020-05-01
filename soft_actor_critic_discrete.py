@@ -128,10 +128,10 @@ def q_update(batch, policy_net, Q_net1, Q_net2, Q_target_net1, Q_target_net2, op
     
     loss_fn = nn.MSELoss()
     loss = loss_fn(q1_sa, target) + loss_fn(q2_sa, target)
-    nn.utils.clip_grad_value_(Q_net1.parameters(), 5)
-    nn.utils.clip_grad_value_(Q_net2.parameters(), 5)
     loss.backward()
 
+    nn.utils.clip_grad_value_(Q_net1.parameters(), 5)
+    nn.utils.clip_grad_value_(Q_net2.parameters(), 5)
     optimizer_q.step()
     #print(loss.item())
     return loss.item()
