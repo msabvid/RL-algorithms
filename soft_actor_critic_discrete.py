@@ -15,7 +15,8 @@ import math
 from tqdm import tqdm
 
 from replay import ReplayBuffer
-
+from networks import FFN, ConvNet
+from gym_wrappers import ClipRewardEnv
 
 class Net(nn.Module):
 
@@ -303,8 +304,9 @@ def train(env, config):
                 train_policy = False
 
             if timesteps_elapsed % config["target_update_freq"] < episode_timesteps:
-                Q_target_net1.soft_update(Q_net1, 0.9)
-                Q_target_net2.soft_update(Q_net2, 0.9)
+                if timesteps_elapsed > config["steps_init_training"]:
+                    Q_target_net1.soft_update(Q_net1, 0.5)
+                    Q_target_net2.soft_update(Q_net2, 0.5)
             
             if timesteps_elapsed % config["eval_freq"] < episode_timesteps:
                 eval_returns = 0
@@ -349,12 +351,13 @@ def train(env, config):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Actor Critic algorithm')
-    parser.add_argument('--env_name', '--env', default='CartPole-v0')
+    parser.add_argument('--env_name', '--env', default='MsPacman-ram-v0')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--play', action='store_true')
     parser.add_argument('--eval_episodes', default=10)
     parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--clip_reward', action='store_true')
 
     args = parser.parse_args()
 
@@ -364,6 +367,8 @@ if __name__ == '__main__':
         device="cpu"
 
     env = gym.make(args.env_name)
+    env = ClipRewardEnv(env)
+    
     obs_dim = env.observation_space.shape[0]
     n_acts = env.action_space.n
 
@@ -375,16 +380,16 @@ if __name__ == '__main__':
             "buffer_capacity":1e6,
             "eval_freq":1000,
             "eval_episodes":args.eval_episodes,
-            "learning_rate_policy":0.0005,
-            "learning_rate_value":0.0004,
-            "learning_rate_alpha":0.0004,
-            "hidden_size":(10,5),
+            "learning_rate_policy":0.0003,
+            "learning_rate_value":0.0003,
+            "learning_rate_alpha":0.0003,
+            "hidden_size":(64,32,16),
             "batch_size":64,
-            "target_entropy_ratio":0.99,
+            "target_entropy_ratio":0.98,
             "train_policy_freq":100,
             "target_update_freq":8000,
             "target_return":180,
-            "steps_init_training":1000,
+            "steps_init_training":20000,
             "steps_per_learning_update":4,
             "gamma":0.99,
             "alpha":0.1,
