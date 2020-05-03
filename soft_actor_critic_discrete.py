@@ -11,6 +11,7 @@ import argparse
 from torch.distributions.categorical import Categorical
 import copy
 import time
+import math
 from tqdm import tqdm
 
 from replay import ReplayBuffer
@@ -66,10 +67,10 @@ def choose_action(obs, policy_net, explore=True):
         try:
             action = policy.sample()
             policy_law = F.softmax(logits)
-            entropy = -torch.sum(torch.log(policy_law+1e-8) * policy_law, 1, keepdim=True)
+            entropy = -torch.sum(torch.log(policy_law+1e-8) * policy_law, 1, keepdim=True) #we avoid numerical problems
             #print(entropy.item())
         except:
-            print('nans!')
+            raise ValueError('nans!')
     else:
         probs = F.softmax(logits)
         action=torch.argmax(probs)
@@ -97,7 +98,7 @@ def policy_update(batch, policy_net, Q_net1, Q_net2, optimizer_policy, alpha):
     loss = -torch.mean(E_q + alpha*entropy)
     
     loss.backward()
-    nn.utils.clip_grad_value_(policy_net.parameters(), 5)
+    nn.utils.clip_grad_norm_(policy_net.parameters(), 5)
     optimizer_policy.step()
     #print("updating policy, loss = {}, Mean(E_q)={}, Mean(Entropy)={}".format(loss.item(),E_q.mean().item(), (alpha*entropy).mean().item()))
     return loss.item()
@@ -130,12 +131,25 @@ def q_update(batch, policy_net, Q_net1, Q_net2, Q_target_net1, Q_target_net2, op
     loss = loss_fn(q1_sa, target) + loss_fn(q2_sa, target)
     loss.backward()
 
-    nn.utils.clip_grad_value_(Q_net1.parameters(), 5)
-    nn.utils.clip_grad_value_(Q_net2.parameters(), 5)
+    nn.utils.clip_grad_norm_(Q_net1.parameters(), 5)
+    nn.utils.clip_grad_norm_(Q_net2.parameters(), 5)
     optimizer_q.step()
     #print(loss.item())
     return loss.item()
 
+
+
+def alpha_update(batch, log_alpha, policy_net, optimizer_alpha, entropy_target):
+    optimizer_alpha.zero_grad()
+    with torch.no_grad():
+        logits = policy_net(batch.next_states)
+        policy_law = F.softmax(logits)
+
+    entropy = -torch.sum(torch.log(policy_law+1e-8) * policy_law, 1, keepdim=True)
+    loss = torch.mean(log_alpha * (entropy - entropy_target))
+    loss.backward()
+    optimizer_alpha.step()
+    return loss
 
 
 def play_episode(env, 
@@ -146,7 +160,9 @@ def play_episode(env,
         Q_target_net2,
         optimizer_policy,
         optimizer_q,
-        alpha,
+        optimizer_alpha,
+        log_alpha,
+        entropy_target,
         gamma,
         replay_buffer, 
         train=True,
@@ -182,14 +198,17 @@ def play_episode(env,
         if train and len(replay_buffer)>=steps_init_training:
             if episode_timesteps % steps_per_learning_update==0:
                 batch = replay_buffer.sample(batch_size, device)
+                Q_net1.unfreeze(); Q_net2.unfreeze(); policy_net.freeze()
+                loss_critic = q_update(batch, policy_net, Q_net1, Q_net2, Q_target_net1, Q_target_net2, optimizer_q, torch.exp(log_alpha), gamma)
                 
-                if episode_timesteps % 2*steps_per_learning_update == 0:
-                    Q_net1.unfreeze(); Q_net2.unfreeze(); policy_net.freeze()
-                    loss_critic = q_update(batch, policy_net, Q_net1, Q_net2, Q_target_net1, Q_target_net2, optimizer_q, alpha, gamma)
-                else:
-                    Q_net1.freeze(); Q_net2.freeze(); policy_net.unfreeze()
-                    loss_actor = policy_update(batch, policy_net, Q_net1, Q_net2, optimizer_policy, alpha)
+                batch = replay_buffer.sample(batch_size, device)
+                Q_net1.freeze(); Q_net2.freeze(); policy_net.unfreeze()
+                loss_actor = policy_update(batch, policy_net, Q_net1, Q_net2, optimizer_policy, torch.exp(log_alpha))
             
+                batch = replay_buffer.sample(batch_size, device)
+                loss_alpha = alpha_update(batch, log_alpha, policy_net, optimizer_alpha, entropy_target)
+
+
         episode_timesteps +=1
         episode_return += reward
         
@@ -228,9 +247,13 @@ def train(env, config):
     Q_target_net2 = copy.deepcopy(Q_net2)
     Q_target_net1.freeze(); Q_target_net2.freeze()
     
+    log_alpha = nn.Parameter(torch.Tensor([math.log(config["alpha"])], device=config["device"]))
+    entropy_target = -math.log(1/ACTION_SIZE)*config["target_entropy_ratio"] # that is, maximum entropy times a ratio
+    
     optimizer_policy = torch.optim.Adam(policy_net.parameters(), lr = config["learning_rate_policy"])
     optimizer_q = torch.optim.Adam(list(Q_net1.parameters())+list(Q_net2.parameters()),
             lr = config["learning_rate_value"])
+    optimizer_alpha = torch.optim.Adam([log_alpha], lr = config["learning_rate_alpha"])
 
     replay_buffer = ReplayBuffer(config["buffer_capacity"])
 
@@ -256,7 +279,9 @@ def train(env, config):
                     Q_target_net2=Q_target_net2,
                     optimizer_policy=optimizer_policy,
                     optimizer_q=optimizer_q,
-                    alpha=config["alpha"],
+                    optimizer_alpha=optimizer_alpha,
+                    log_alpha=log_alpha,
+                    entropy_target=entropy_target,
                     gamma=config["gamma"],
                     replay_buffer=replay_buffer,
                     train=True,
@@ -293,7 +318,9 @@ def train(env, config):
                             Q_target_net2,
                             optimizer_policy,
                             optimizer_q,
-                            alpha=config["alpha"],
+                            optimizer_alpha=optimizer_alpha,
+                            log_alpha=log_alpha,
+                            entropy_target=entropy_target,
                             gamma=config["gamma"],
                             replay_buffer=replay_buffer,
                             train=False,
@@ -322,7 +349,7 @@ def train(env, config):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Actor Critic algorithm')
-    parser.add_argument('--env_name', '--env', default='LunarLander-v2')
+    parser.add_argument('--env_name', '--env', default='CartPole-v0')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--play', action='store_true')
@@ -350,8 +377,10 @@ if __name__ == '__main__':
             "eval_episodes":args.eval_episodes,
             "learning_rate_policy":0.0005,
             "learning_rate_value":0.0004,
+            "learning_rate_alpha":0.0004,
             "hidden_size":(10,5),
             "batch_size":64,
+            "target_entropy_ratio":0.99,
             "train_policy_freq":100,
             "target_update_freq":8000,
             "target_return":180,
