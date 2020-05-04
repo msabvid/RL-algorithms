@@ -1,4 +1,4 @@
-from collections import namedtuple
+from collections import namedtuple, deque
 import numpy as np
 import torch
 
@@ -8,6 +8,59 @@ Transition = namedtuple(
 )
 
 
+
+class NstepBuffer:
+
+    def __init__(self, max_steps):
+
+        self.max_steps = max_steps
+        self.memory = None
+
+    def init_memory(self, transition: Transition):
+        """Initialises the memory with zero-entries
+        
+        Parameters
+        ----------
+        transition: Transition
+            transition(s) to take the dimensionalities from
+        """
+        #for t in transition:
+        #    assert t.ndim == 1  # sanity check
+
+        self.memory = Transition(
+            *[deque() for t in transition]
+        )
+    
+    def push(self, *args):
+        """Adds transitions to the memory
+
+        """
+        if not self.memory:
+            self.init_memory(Transition(*args))
+
+        for i, data in enumerate(args):
+            self.memory[i].append(data)
+
+    
+    def get_n_step_reward(self, gamma):
+        reward = 0
+        for i in range(self.max_steps):
+            reward += gamma ** i * self.memory.rewards[i]
+        return reward
+
+    def pop_left(self):
+        obs = self.memory.states.popleft()
+        action = self.memory.actions.popleft()
+        self.memory.next_states.popleft()
+        self.memory.rewards.popleft()
+        self.memory.done.popleft()
+        return obs, action
+
+    def __len__(self):
+        return len(self.memory[0])
+
+
+
 class ReplayBuffer:
     """Replay buffer to sample experience/ transition tuples from
     """
@@ -15,12 +68,19 @@ class ReplayBuffer:
     def __init__(self, capacity: int):
         """Constructor for a ReplayBuffer initialising an empty buffer (without memory
         
-        :param capacity (int): total capacity of the replay buffer
+        Parameters
+        ----------
+        capacity: int
+            total capacity of the replay buffer
 
-        :attr memory (Transition):
+        Attributes
+        ----------
+        memory: (Transition):
             Each component of the transition tuple is represented by a zero-initialised np.ndarray of
             floats with dimensionality (total buffer capacity, component dimensionality)
-        :attr writes (int): number of experiences/ transitions already added to the buffer
+        
+        writes: int
+            number of experiences/ transitions already added to the buffer
         """
         self.capacity = int(capacity)
         self.memory = None
@@ -28,14 +88,17 @@ class ReplayBuffer:
 
     def init_memory(self, transition: Transition):
         """Initialises the memory with zero-entries
-
-        :param transition (Transition): transition(s) to take the dimensionalities from
+        
+        Parameters
+        ----------
+        transition: Transition
+            transition(s) to take the dimensionalities from
         """
-        for t in transition:
-            assert t.ndim == 1  # sanity check
+        #for t in transition:
+        #    assert t.ndim == 1  # sanity check
 
         self.memory = Transition(
-            *[np.zeros([self.capacity, t.size], dtype=t.dtype) for t in transition]
+            *[np.zeros([self.capacity, *t.shape], dtype=t.dtype) for t in transition]
         )
 
     def push(self, *args):
@@ -76,3 +139,4 @@ class ReplayBuffer:
         """Gives the length of the buffer
         """
         return min(self.writes, self.capacity)
+
