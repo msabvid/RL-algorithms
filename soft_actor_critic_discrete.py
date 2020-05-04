@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from replay import ReplayBuffer
 from networks import FFN, ConvNet
-from gym_wrappers import ClipRewardEnv
+from gym_wrappers import ClipRewardEnv, ResizeFrameEnv
 
 class Net(nn.Module):
 
@@ -59,6 +59,12 @@ class Net(nn.Module):
         
 
 
+def init_weights(m):
+    if type(m)==nn.Linear:
+        nn.init.kaiming_normal_(m.weight.data, nonlinearity="relu")
+        #nn.init.xavier_normal_(m.bias.data, gain=math.sqrt(2))
+
+
 def choose_action(obs, policy_net, explore=True):
     with torch.no_grad():
         logits = policy_net(obs.float())
@@ -73,11 +79,23 @@ def choose_action(obs, policy_net, explore=True):
         except:
             raise ValueError('nans!')
     else:
-        probs = F.softmax(logits)
-        action=torch.argmax(probs)
+        with torch.no_grad():
+            probs = F.softmax(logits)
+            action=torch.argmax(probs)
+            
+            policy_law = F.softmax(logits)
+            entropy = -torch.sum(torch.log(policy_law+1e-8) * policy_law, 1, keepdim=True) #we avoid numerical problems
+        #print(entropy)
     #action = policy.sample()
     return action.item()
 
+
+def get_norm_inf(m):
+    norms = []
+    for p in m.parameters():
+        norms.append(torch.norm(p.grad, p=float('inf')).view(-1,1))
+    norms = torch.cat(norms)
+    return torch.norm(norms, p=float("inf"))
 
 
 def policy_update(batch, policy_net, Q_net1, Q_net2, optimizer_policy, alpha):
@@ -101,6 +119,8 @@ def policy_update(batch, policy_net, Q_net1, Q_net2, optimizer_policy, alpha):
     loss.backward()
     nn.utils.clip_grad_norm_(policy_net.parameters(), 5)
     optimizer_policy.step()
+    with open("diagnostic_policy.txt","a") as f:
+        f.write("loss={}, norm grad = {}, alpha={}, mean_entropy={}\n".format(loss.item(), get_norm_inf(policy_net).item(), alpha.item(), entropy.mean().item()))
     #print("updating policy, loss = {}, Mean(E_q)={}, Mean(Entropy)={}".format(loss.item(),E_q.mean().item(), (alpha*entropy).mean().item()))
     return loss.item()
 
@@ -135,7 +155,8 @@ def q_update(batch, policy_net, Q_net1, Q_net2, Q_target_net1, Q_target_net2, op
     nn.utils.clip_grad_norm_(Q_net1.parameters(), 5)
     nn.utils.clip_grad_norm_(Q_net2.parameters(), 5)
     optimizer_q.step()
-    #print(loss.item())
+    with open("diagnostic_q.txt","a") as f:
+        f.write("loss={}, norm grad = {}\n".format(loss.item(), get_norm_inf(Q_net1).item()))
     return loss.item()
 
 
@@ -149,6 +170,7 @@ def alpha_update(batch, log_alpha, policy_net, optimizer_alpha, entropy_target):
     entropy = -torch.sum(torch.log(policy_law+1e-8) * policy_law, 1, keepdim=True)
     loss = torch.mean(log_alpha * (entropy - entropy_target))
     loss.backward()
+    nn.utils.clip_grad_norm_(log_alpha, 5)
     optimizer_alpha.step()
     return loss
 
@@ -185,7 +207,7 @@ def play_episode(env,
     episode_return = 0
     
     while not done:
-        action = choose_action(torch.from_numpy(obs).unsqueeze(0).to(device), policy_net, explore=train)
+        action = choose_action(torch.from_numpy(obs).unsqueeze(0).to(device=device), policy_net, explore=train)
         new_obs, reward, done, _ = env.step(action)
         replay_buffer.push(
             np.array(obs, dtype=np.float32),
@@ -209,6 +231,8 @@ def play_episode(env,
                 batch = replay_buffer.sample(batch_size, device)
                 loss_alpha = alpha_update(batch, log_alpha, policy_net, optimizer_alpha, entropy_target)
 
+                Q_target_net1.soft_update(Q_net1, 0.005)
+                Q_target_net2.soft_update(Q_net2, 0.005)
 
         episode_timesteps +=1
         episode_return += reward
@@ -240,15 +264,18 @@ def train(env, config):
     STATE_SIZE = env.observation_space.shape[0]
     ACTION_SIZE = env.action_space.n
 
-    policy_net = Net(sizes=(STATE_SIZE, *config["hidden_size"], ACTION_SIZE)).to(config["device"])
+    policy_net = Net(sizes=(STATE_SIZE, *config["hidden_size"], ACTION_SIZE)).to(device=config["device"])
+    policy_net.apply(init_weights)
 
-    Q_net1= Net(sizes=(STATE_SIZE, *config["hidden_size"], ACTION_SIZE)).to(config["device"])
-    Q_net2= Net(sizes=(STATE_SIZE, *config["hidden_size"], ACTION_SIZE)).to(config["device"])
+    Q_net1= Net(sizes=(STATE_SIZE, *config["hidden_size"], ACTION_SIZE)).to(device=config["device"])
+    Q_net1.apply(init_weights)
+    Q_net2= Net(sizes=(STATE_SIZE, *config["hidden_size"], ACTION_SIZE)).to(device=config["device"])
+    Q_net2.apply(init_weights)
     Q_target_net1 = copy.deepcopy(Q_net1)
     Q_target_net2 = copy.deepcopy(Q_net2)
     Q_target_net1.freeze(); Q_target_net2.freeze()
     
-    log_alpha = nn.Parameter(torch.Tensor([math.log(config["alpha"])], device=config["device"]))
+    log_alpha = nn.Parameter(torch.tensor([math.log(config["alpha"])], device=config["device"]))
     entropy_target = -math.log(1/ACTION_SIZE)*config["target_entropy_ratio"] # that is, maximum entropy times a ratio
     
     optimizer_policy = torch.optim.Adam(policy_net.parameters(), lr = config["learning_rate_policy"])
@@ -303,10 +330,10 @@ def train(env, config):
             else:
                 train_policy = False
 
-            if timesteps_elapsed % config["target_update_freq"] < episode_timesteps:
-                if timesteps_elapsed > config["steps_init_training"]:
-                    Q_target_net1.soft_update(Q_net1, 0.5)
-                    Q_target_net2.soft_update(Q_net2, 0.5)
+            #if timesteps_elapsed % config["target_update_freq"] < episode_timesteps:
+            #    if timesteps_elapsed > config["steps_init_training"]:
+            #        Q_target_net1.soft_update(Q_net1, 0.2)
+            #        Q_target_net2.soft_update(Q_net2, 0.2)
             
             if timesteps_elapsed % config["eval_freq"] < episode_timesteps:
                 eval_returns = 0
@@ -349,9 +376,9 @@ def train(env, config):
 
 
 if __name__ == '__main__':
-
+    torch.manual_seed(10)
     parser = argparse.ArgumentParser(description='Actor Critic algorithm')
-    parser.add_argument('--env_name', '--env', default='MsPacman-ram-v0')
+    parser.add_argument('--env_name', '--env', default='CartPole-v0')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--play', action='store_true')
@@ -362,23 +389,25 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if torch.cuda.is_available():
-        device = "device:{}".format(args.device)
+        device = "cuda:{}".format(args.device)
     else:
         device="cpu"
 
     env = gym.make(args.env_name)
-    env = ClipRewardEnv(env)
+    #env = ResizeFrameEnv(env)
+    if args.clip_reward:
+         env = ClipRewardEnv(env)
     
     obs_dim = env.observation_space.shape[0]
     n_acts = env.action_space.n
 
     CONFIG = {
             "env":args.env_name,
-            "episode_length":500,
+            "episode_length":3000,
             "max_timesteps":int(2e6),
-            "max_time":90*60,
+            "max_time":180*60,
             "buffer_capacity":1e6,
-            "eval_freq":1000,
+            "eval_freq":10000,
             "eval_episodes":args.eval_episodes,
             "learning_rate_policy":0.0003,
             "learning_rate_value":0.0003,
@@ -387,8 +416,8 @@ if __name__ == '__main__':
             "batch_size":64,
             "target_entropy_ratio":0.98,
             "train_policy_freq":100,
-            "target_update_freq":8000,
-            "target_return":180,
+            "target_update_freq":4,
+            "target_return":790,
             "steps_init_training":20000,
             "steps_per_learning_update":4,
             "gamma":0.99,
