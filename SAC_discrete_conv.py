@@ -18,46 +18,7 @@ from replay import ReplayBuffer, NstepBuffer
 from networks import FFN, ConvNet
 from gym_wrappers import ClipRewardEnv, ResizeFrameEnv
 
-class Net(nn.Module):
-
-    def __init__(self, sizes, activation=nn.ReLU, output_activation=nn.Identity):
-        super().__init__()
-
-        layers = []
-        for j in range(len(sizes)-1):
-            layers.append(nn.Linear(sizes[j], sizes[j+1]))
-            if j<(len(sizes)-2):
-                layers.append(activation())
-            else:
-                layers.append(output_activation())
-
-        self.net = nn.Sequential(*layers)
-
-    def freeze(self):
-        for p in self.parameters():
-            p.requires_grad=False
-
-    def unfreeze(self):
-        for p in self.parameters():
-            p.requires_grad=True
-
-    def hard_update(self, source_net):
-        """Updates the network parameters by copying the parameters
-        of another network
-        """
-        for target_param, source_param in zip(self.parameters(), source_net.parameters()):
-            target_param.data.copy_(source_param.data)
-
-    def soft_update(self, source_net, tau):
-        """Updates the network parameters with a soft update by polyak averaging
-        """
-        for target_param, source_param in zip(self.parameters(), source_net.parameters()):
-            target_param.data.copy_((1-tau)*target_param.data + tau*source_param.data)
-    
-    def forward(self, x):
-        return self.net(x)
         
-
 
 def init_weights(m):
     if type(m)==nn.Linear:
@@ -85,8 +46,6 @@ def choose_action(obs, policy_net, explore=True):
             
             policy_law = F.softmax(logits)
             entropy = -torch.sum(torch.log(policy_law+1e-8) * policy_law, 1, keepdim=True) #we avoid numerical problems
-        #print(entropy)
-    #action = policy.sample()
     return action.item()
 
 
@@ -112,18 +71,9 @@ def policy_update(batch, policy_net, Q_net1, Q_net2, optimizer_policy, alpha):
     loss.backward()
     nn.utils.clip_grad_norm_(policy_net.parameters(), 5)
     optimizer_policy.step()
-    #print("updating policy, loss = {}, Mean(E_q)={}, Mean(Entropy)={}".format(loss.item(),E_q.mean().item(), (alpha*entropy).mean().item()))
     with open("diagnostic_policy.txt","a") as f:
         f.write("loss={}, norm grad = {}, alpha={}, mean_entropy={}\n".format(loss.item(), get_norm_inf(policy_net).item(), alpha.item(), entropy.mean().item()))
     return loss.item()
-
-
-def get_norm_inf(m):
-    norms = []
-    for p in m.parameters():
-        norms.append(torch.norm(p.grad, p=float('inf')).view(-1,1))
-    norms = torch.cat(norms)
-    return torch.norm(norms, p=float("inf"))
 
 
 
@@ -157,10 +107,8 @@ def q_update(batch, policy_net, Q_net1, Q_net2, Q_target_net1, Q_target_net2, op
     nn.utils.clip_grad_norm_(Q_net2.parameters(), 5)
     optimizer_q.step()
 
-    
     with open("diagnostic_q.txt","a") as f:
         f.write("loss={}, norm grad = {}\n".format(loss.item(), get_norm_inf(Q_net1).item()))
-    #print(loss.item())
     return loss.item()
 
 
@@ -246,9 +194,6 @@ def play_episode(env,
                 batch = replay_buffer.sample(batch_size, device)
                 loss_alpha = alpha_update(batch, log_alpha, policy_net, optimizer_alpha, entropy_target)
 
-                #Q_target_net1.soft_update(Q_net1, 0.001)
-                #Q_target_net2.soft_update(Q_net2, 0.001)
-
         episode_timesteps +=1
         episode_return += reward
         
@@ -257,13 +202,8 @@ def play_episode(env,
         
         if max_steps == episode_timesteps:
             break
-
         # we are done, prepare for next action
         obs = new_obs
-    #try:
-    #    print("loss actor {}, loss critic {}".format(loss_actor, loss_critic))
-    #except:
-    #    pass
     return episode_timesteps, episode_return
 
 
